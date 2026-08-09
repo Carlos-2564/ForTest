@@ -51,31 +51,8 @@ class LEOSatEnv:
         self.lambda_wave = 3e8 / self.fc  # 波长
 
         # ---------- 2. 波位几何布局 (对应 1.3 节 图5) ----------
-        # 12个波位均匀分布在星下点周围，半径为 [50, 150, 250] km 的3层同心圆上
-        # 每层4个，均匀分布 (角度 0°, 90°, 180°, 270°)
+        # 12个波位均匀分布在星下点周围，参考图5  见后文
         self.spot_positions = self._generate_spot_positions()
-
-        def _generate_spot_positions_hex(self):
-            # 六边形蜂窝布局，每个波位半径约73km
-            R = 73  # 波位半径 (km)
-            # 中心波位
-            positions = [(0, 0)]
-            # 第一层 6 个波位，半径 2R
-            r1 = 2 * R
-            for k in range(6):
-                angle = np.deg2rad(60 * k + 30)  # 偏移30度使边对齐
-                x = r1 * np.cos(angle)
-                y = r1 * np.sin(angle)
-                positions.append((x, y))
-            # 第二层 5 个波位（取5个凑够12），半径 4R
-            r2 = 4 * R
-            # 取角度 0, 60, 120, 180, 240（跳过300）
-            for k in range(5):
-                angle = np.deg2rad(60 * k)
-                x = r2 * np.cos(angle)
-                y = r2 * np.sin(angle)
-                positions.append((x, y))
-            return np.array(positions)
 
         # ---------- 3. 预计算干扰矩阵 (公式2~5) ----------
         # interference_matrix[i][j] 表示当波位 i 和 j 同时被点亮时，i 受到 j 的干扰功率 (W)
@@ -101,10 +78,21 @@ class LEOSatEnv:
         # 打印状态
         print(f"[Env] 初始化完成 | 目标: {objective} | 波位数: {self.N} | 波束数: {self.K}")
 
+
+
+
+
+
+
+
+
+
+
+
     # ========================================================================
-    # 1. 波位布局生成 (对应 1.3 节) 对应图五 L已核对 顺序皆相同
+    # 1. 波位布局生成 (对应 1.3 节) 单位km 对应图五 L已核对 顺序皆相同
     # ========================================================================
-    def _generate_spot_positions_hex(self):
+    def _generate_spot_positions(self):
         # 波位半径 R (km)
         R = 73
         # 相邻波位中心距 d = sqrt(3) * R
@@ -147,16 +135,15 @@ class LEOSatEnv:
         提前算好 12x12 的干扰功率矩阵 (W)
         避免在 step() 中重复计算贝塞尔函数，大幅提升训练速度
         """
-        N = self.N
-        interference = np.zeros((N, N))
+        N = self.N # 波位总数 12
+        interference = np.zeros((N, N)) #12*12 所有元素均为0 的数组
 
         # 卫星到各波位的距离 d_i (公式中 d_n) 和 俯仰角相关因子
         for i in range(N):
             for j in range(N):
-                if i == j:
-                    continue  # 自身不产生干扰
+                if i == j:continue        # 自身对自身无影响
 
-                # 波位 i 和 j 的坐标 (单位: km)
+                # 波位 i 和 j 的坐标 读之前的波位布局生成
                 xi, yi = self.spot_positions[i]
                 xj, yj = self.spot_positions[j]
 
@@ -168,22 +155,28 @@ class LEOSatEnv:
                 d_j = np.sqrt(xj ** 2 + yj ** 2 + (self.h / 1000) ** 2)
 
                 # 转换为米 (公式中需要米)
+                # ?暂疑惑 哪里提到用m 后文统一用m算 累了不改
                 d_i_m = d_i * 1000
-                d_j_m = d_j * 1000
+                d_j_n = d_j * 1000
                 d_horizontal_ij_m = d_horizontal_ij * 1000
 
                 # ----- 公式(5): 计算夹角 θ_mn (弧度) -----
                 # 简化计算: 利用余弦定理
                 # cos(theta) = (d_m^2 + d_n^2 - d_mn^2) / (2 * d_m * d_n)
-                # 注意: 原文公式(5)中分母符号有笔误，这里采用标准余弦定理
-                cos_theta = (d_i_m ** 2 + d_j_m ** 2 - d_horizontal_ij_m ** 2) / (2 * d_i_m * d_j_m)
+                # 注: 原文公式(5)中分母符号有笔误，这里采用标准余弦定理  L：检查为等效
+                cos_theta = (d_i_m ** 2 + d_j_n ** 2 - d_horizontal_ij_m ** 2) / (2 * d_i_m * d_j_n)
                 # 防止数值溢出 (-1 ~ 1 截断)
-                cos_theta = np.clip(cos_theta, -1.0, 1.0)
-                theta_mn = np.arccos(cos_theta)
+                cos_theta = np.clip(cos_theta, -1.0, 1.0) #NumPy 的裁剪函数每一个值限制在 [-1.0, 1.0] 的闭区间内 更的大直接变1
+                theta_mn = np.arccos(cos_theta) #得到角 θ_mn
 
                 # ----- 公式(4): 计算 u_mn -----
-                # 假设 3dB 波束宽度对应的 sin(theta_3dB) ≈ 0.01 (典型相控阵天线)
-                sin_theta_3db = 0.01
+
+                """L:通常在卫星通信设计中，一个 3dB 波束正好覆盖一个蜂窝波位（即波位边缘的功率衰减为 3dB）。
+                因此，波位半径 R 在卫星天线处所张开的半角即为 \theta_{3\text{dB}}
+               sin_theta_3db = 73/np.sqrt(73**2+self.h**2)轨道高度570  #km/km 结果相同
+               算得为0.12703 
+               """
+                sin_theta_3db =0.12703
                 u_mn = 2.07123 * np.sin(theta_mn) / sin_theta_3db
 
                 # ----- 公式(3): 天线增益 G(theta) -----
@@ -193,11 +186,17 @@ class LEOSatEnv:
                     J1 = jv(1, u_mn)  # 一阶贝塞尔函数
                     J3 = jv(3, u_mn)  # 三阶贝塞尔函数
                     # 注意: 原文公式(3)分母为 2*u_i 但应为 2*u_mn，且系数36
+                    """矛盾点：当带入公式(2)计算波位m对波位n的干扰功率I_{mn}时，应该使用的是由夹角theta_{mn}算出的u_{mn}
+                    如果增益公式里还写着u_i就会在逻辑上产生断层（不知道u_i到底指哪个波位）
+                    代码循环中，变量 u_mn 实际代表的就是波位 $i$ 与波位 $j$ 之间的 $u_{ij}$。
+                    把公式(3)里的u_i替换为 u_mn（即u_{ij}），
+                    在计算干扰矩阵的编程实现上是完全正确且必须的 值得提问(1)"""
                     G_theta = (J1 / (2 * u_mn) + 36 * J3 / (u_mn ** 3)) ** 2
 
                 # ----- 公式(2): 干扰功率 I_mn -----
                 # g_m * P_m 近似为总功率/波束数 平均分配，此处用标准功率归一化
                 # 为了简化，令 g_m * P_m = 1 (相对值)，最终干扰只看空间几何
+                # 放你娘的屁
                 # 实际实现中，由于功率分配在 step 中动态计算，这里只算几何衰减因子
                 # 因此 interference[i][j] 存储的是 增益平方 * 路径损耗因子
                 # 路径损耗: (λ / (4π * d_ij))^2  实际公式已有 λ^2/(4πd)^2
