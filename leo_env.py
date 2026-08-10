@@ -50,6 +50,9 @@ class LEOSatEnv:
 
         self.lambda_wave = 3e8 / self.fc  # 波长
 
+
+
+
         # ---------- 2. 波位几何布局 (对应 1.3 节 图5) ----------
         # 12个波位均匀分布在星下点周围，参考图5  见后文
         self.spot_positions = self._generate_spot_positions()
@@ -59,6 +62,25 @@ class LEOSatEnv:
         self.interference_matrix = self._precompute_interference()
 
         # ---------- 4. 队列与统计变量 (对应 1.4 ~ 1.5 节) ----------
+        # 实时队列 ψ_1 (时延敏感) 和非实时队列 ψ_2 (吞吐量敏感)
+
+        self.base_demand = np.array([800, 700, 1300, 300, 980, 250,
+                                     1000, 275, 80, 600, 50, 200]) #图6 估测数据
+        # 2. 严格按论文 1.4 节公式计算空间离散系数 zeta (变异系数 std/mean)
+        mean_demand = np.mean(self.base_demand)
+        std_demand = np.std(self.base_demand)
+        self.zeta = std_demand / mean_demand  # 算得约 0.7205
+        #  归一化空间不均匀因子向量 (均值为 1)
+        self.spatial_factor = self.base_demand / mean_demand
+        # 4. 图 7 提取的 24 小时归一化时间业务量曲线 (1:00 ~ 24:00)
+        self.FIG7_TIME_PROFILE = np.array([
+            0.03, 0.03, 0.03, 0.03, 0.03, 0.03,  # 1:00 - 6:00
+            0.15, 0.26, 0.42, 0.60, 1.00, 0.90,  # 7:00 - 12:00 (11:00达最高峰)
+            0.85, 0.78, 0.66, 0.78, 0.82, 0.68,  # 13:00 - 18:00 (17:00达次高峰)
+            0.42, 0.32, 0.18, 0.10, 0.06, 0.03   ])#图7 估测数据
+        self.total_slots_per_day = 8_640_000  # 一天时隙8640000个
+        self.base_packet_rate = 50# 基准包到达率 (每个 10ms 时隙平均到达的包数  L：？ )
+
         # 实时队列 ψ_1 (时延敏感) 和非实时队列 ψ_2 (吞吐量敏感)
         self.realtime_queue = np.zeros(self.N, dtype=np.int32)  # 积压的实时包个数
         self.nrt_queue = np.zeros(self.N, dtype=np.int32)  # 积压的非实时包个数
@@ -77,11 +99,6 @@ class LEOSatEnv:
 
         # 打印状态
         print(f"[Env] 初始化完成 | 目标: {objective} | 波位数: {self.N} | 波束数: {self.K}")
-
-
-
-
-
 
 
 
@@ -134,6 +151,7 @@ class LEOSatEnv:
         """
         提前算好 12x12 的干扰功率矩阵 (W)
         避免在 step() 中重复计算贝塞尔函数，大幅提升训练速度
+        用以计算 self对象 由在之前的position 得出其他波位对自己的I_mn/P_m
         """
         N = self.N # 波位总数 12
         interference = np.zeros((N, N)) #12*12 所有元素均为0 的数组
@@ -191,51 +209,53 @@ class LEOSatEnv:
                     代码循环中，变量 u_mn 实际代表的就是波位 $i$ 与波位 $j$ 之间的 $u_{ij}$。
                     把公式(3)里的u_i替换为 u_mn（即u_{ij}），
                     在计算干扰矩阵的编程实现上是完全正确且必须的 值得提问(1)"""
-                    G_theta = (J1 / (2 * u_mn) + 36 * J3 / (u_mn ** 3)) ** 2
+
+
+
+                    G_theta = (10**(self.G_t/10))*((J1 / (2 * u_mn) + 36 * J3 / (u_mn ** 3)) ** 2)
 
                 # ----- 公式(2): 干扰功率 I_mn -----
                 # g_m * P_m 近似为总功率/波束数 平均分配，此处用标准功率归一化
-                # 为了简化，令 g_m * P_m = 1 (相对值)，最终干扰只看空间几何
-                # 放你娘的屁
+                # 为了简化，令 g_m * P_m = 1 (相对值)，最终干扰只看空间几何 L:放你娘的屁
                 # 实际实现中，由于功率分配在 step 中动态计算，这里只算几何衰减因子
                 # 因此 interference[i][j] 存储的是 增益平方 * 路径损耗因子
                 # 路径损耗: (λ / (4π * d_ij))^2  实际公式已有 λ^2/(4πd)^2
-                path_loss = (self.lambda_wave / (4 * np.pi * d_horizontal_ij_m)) ** 2
+                path_loss =  (self.lambda_wave / (4 * np.pi * d_horizontal_ij_m)) ** 2
 
-                # 组合: 干扰因子 (相对值，后续乘以实际功率)
-                interference[i][j] = G_theta * path_loss
+                # 组合: 干扰因子 (相对值，等于I_m/ P_m,后续乘以实际功率Pm ) G_m * G_theta * path_loss
+                interference[i][j] =  G_theta * path_loss
 
-        return interference
+        return interference  #L审核完成 最终返回二维数组 m对n的影响因子
 
     # ========================================================================
     # 3. 业务到达率生成 (对应 1.4 节 公式8, 图6, 图7)
     # ========================================================================
+    # def _get_traffic_rates(self, current_slot):
+    #     """L重写 抄录图6 数据 手算zeta"""
+    #
+    #     """
+    #     根据空间离散系数 ζ 和时间加权因子生成当前时隙的泊松到达率
+    #
+    #     返回:
+    #         lambda_rt (np.array): 12个波位的实时包到达率 (包/时隙)
+    #         lambda_nrt (np.array): 12个波位的非实时包到达率 (包/时隙)
+
+
     def _get_traffic_rates(self, current_slot):
-        """
-        根据空间离散系数 ζ 和时间加权因子生成当前时隙的泊松到达率
+            # 映射当前时隙对应图 7 的具体小时 (0 ~ 23)
+        hour_idx = int((current_slot / self.total_slots_per_day) * 24) % 24
+        time_factor = self.FIG7_TIME_PROFILE[hour_idx]
 
-        返回:
-            lambda_rt (np.array): 12个波位的实时包到达率 (包/时隙)
-            lambda_nrt (np.array): 12个波位的非实时包到达率 (包/时隙)
-        """
-        # (1) 空间分布 (图6): 假设波位0~3高密度，4~7中密度，8~11低密度
-        # 离散系数 ζ 越大，空间分布越不均 (论文公式8)
-        zeta = 0.5  # 中等空间不均性
-        base_demand = np.array([100, 80, 60, 40, 90, 70, 50, 30, 60, 40, 20, 10])
-        # 加入随机扰动增加空间离散度
-        spatial_factor = base_demand / np.mean(base_demand) * (1 + zeta * np.random.randn(self.N))
-        spatial_factor = np.maximum(spatial_factor, 0.1)  # 保证非负
+            # 各波位的期望包到达率
+        total_expected_rate = self.spatial_factor * time_factor * self.base_packet_rate
 
-        # (2) 时间周期性 (图7): 模拟 9:00~14:00 业务波峰波谷
-        # 假设每个时隙10ms，1000时隙 = 10秒，我们模拟一个简化的日周期
-        # 在 500 时隙处达到峰值 (对应11:00)
-        time_factor = 0.5 + 0.5 * np.sin(np.pi * current_slot / 500)
-        time_factor = np.clip(time_factor, 0.3, 1.0)
+            # 区分 RT 与 NRT (1:1 分配)
+        lambda_rt_expected = np.maximum(total_expected_rate * 0.5, 0.0)
+        lambda_nrt_expected = np.maximum(total_expected_rate * 0.5, 0.0)
 
-        # (3) 实时与非实时比例 (1:1)
-        total_rate = spatial_factor * time_factor * 50  # 基值50包/时隙
-        lambda_rt = (total_rate * 0.5).astype(int)
-        lambda_nrt = (total_rate * 0.5).astype(int)
+        # 泊松采样
+        lambda_rt = np.random.poisson(lambda_rt_expected)
+        lambda_nrt = np.random.poisson(lambda_nrt_expected)
 
         return lambda_rt, lambda_nrt
 
