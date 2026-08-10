@@ -470,18 +470,28 @@ class LEOSatEnv:
         if self.objective == 'throughput':
             reward = float(served_nrt_total)
 
-        elif self.objective == 'delay':
-            # 采用全网实时包的加权平均时延作为公式 (9) 的计算结果
+
+        elif self.objective == 'delay': #为了防止较多积压时，reward 为负数 加入防爆项与平滑截断
+
             total_rt_packets = sum([len(q) for q in self.rt_queue_timestamps])
+
             if total_rt_packets > 0:
-                # 计算当前时刻全网所有实时包的平均排队时延
+
                 system_avg_delay = np.sum(
-                    [current_rt_delays[i] * len(self.rt_queue_timestamps[i]) for i in range(self.N)]) / total_rt_packets
+
+                    [current_rt_delays[i] * len(self.rt_queue_timestamps[i]) for i in range(self.N)]
+
+                ) / total_rt_packets
+
             else:
+
                 system_avg_delay = 0.0
 
-            # 奖励归一化：负的时延占比，目标是让 delay 越小越好
-            reward = - float(system_avg_delay / self.delay_threshold)
+            # 规范化到 [-1, 0] 区间，避免极值爆炸
+
+            normalized_delay = min(system_avg_delay / self.delay_threshold, 2.0)
+
+            reward = -float(normalized_delay)
 
         elif self.objective == 'satisfaction':
             satisfaction = self.cumulative_served / (self.cumulative_demanded + 1e-8)
