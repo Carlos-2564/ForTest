@@ -70,8 +70,8 @@ class LEOSatEnv:
         mean_demand = np.mean(self.base_demand)
         std_demand = np.std(self.base_demand)
         self.zeta = std_demand / mean_demand  # 算得约 0.7205
-        #  归一化空间不均匀因子向量 (均值为 1)
-        self.spatial_factor = self.base_demand / mean_demand
+        #  归一化空间不均匀因子向量 (这里的归一化 指 均值为 1)
+        self.spatial_factor = self.base_demand / mean_demand #图6每个波位的占比*12
         # 4. 图 7 提取的 24 小时归一化时间业务量曲线 (1:00 ~ 24:00)
         self.FIG7_TIME_PROFILE = np.array([
             0.03, 0.03, 0.03, 0.03, 0.03, 0.03,  # 1:00 - 6:00
@@ -228,7 +228,7 @@ class LEOSatEnv:
         return interference  #L审核完成 最终返回二维数组 m对n的影响因子
 
     # ========================================================================
-    # 3. 业务到达率生成 (对应 1.4 节 公式8, 图6, 图7)
+    # 3. 业务到达率生成 (对应 1.4 节 公式8, 图6, 图7) L：算出实时与实时业务量的均值 random模拟出实际状况
     # ========================================================================
     # def _get_traffic_rates(self, current_slot):
     #     """L重写 抄录图6 数据 手算zeta"""
@@ -244,16 +244,20 @@ class LEOSatEnv:
     def _get_traffic_rates(self, current_slot):
             # 映射当前时隙对应图 7 的具体小时 (0 ~ 23)
         hour_idx = int((current_slot / self.total_slots_per_day) * 24) % 24
-        time_factor = self.FIG7_TIME_PROFILE[hour_idx]
+        time_factor = self.FIG7_TIME_PROFILE[hour_idx] #提取这个时段的占比 所谓的什么因子
 
-            # 各波位的期望包到达率
+        # 各波位的期望包到达率
+        # 即当前时隙该波位所有数据包的总期望到达率
         total_expected_rate = self.spatial_factor * time_factor * self.base_packet_rate
 
-            # 区分 RT 与 NRT (1:1 分配)
+
+        """区分 RT 与 NRT (1:1 分配)这里是假设服务的为1：1 因为文中没有讲 一个个尝试过去 此时暂定0.5：0.5希望我没猜错
+        np.maximum(..., 0.0) 的作用是下界截断 确保大于0.0 """
         lambda_rt_expected = np.maximum(total_expected_rate * 0.5, 0.0)
         lambda_nrt_expected = np.maximum(total_expected_rate * 0.5, 0.0)
 
         # 泊松采样
+        # 根据这个期望均值生成服从泊松分布的真实整数包个数，从而在离散事件仿真中完美模拟真实网络流量的突发性和随机性
         lambda_rt = np.random.poisson(lambda_rt_expected)
         lambda_nrt = np.random.poisson(lambda_nrt_expected)
 
