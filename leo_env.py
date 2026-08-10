@@ -318,24 +318,33 @@ class LEOSatEnv:
             'satisfaction': satisfaction
         }
 
-    # ========================================================================
-    # 6. 计算平均时延 (辅助函数，用于 reward)
-    # ========================================================================
-    def _calculate_avg_delay(self):
-        """
-        估算实时数据包的平均排队时延 (公式9 的简化版本)
-        由于未追踪每个包的时间戳，此处用队列长度/服务速率近似
-        """
-        # 总实时包数
-        total_rt = np.sum(self.realtime_queue)
-        if total_rt == 0:
-            return 0.0
-        # 估算服务速率: 假设当前容量下每时隙平均服务包数
-        # 这里简单用队列长度 * 时隙长度 作为总排队时间的近似
-        # 实际论文中通过公式(17)精确计算
-        avg_delay = total_rt * self.slot_duration * 10  # 粗略放大
-        return avg_delay
 
+    # ========================================================================
+    # 6. 计算平均时延 (对应论文 公式 9)
+    # ========================================================================
+
+    def _calculate_avg_delay(self, capacity_packets=None):
+        """
+        根据公式(9)精确计算/估算实时数据包的平均排队时延 (秒/ms)
+
+        参数:
+            capacity_packets (dict, optional): 当前时隙各波位的服务容量(包数)
+        """
+        total_rt_packets = np.sum(self.realtime_queue)
+        if total_rt_packets == 0:
+            return 0.0
+
+        # 方法 A: 若传入了当前时隙的实际服务容量 (更符合 Little 定律与物理传输)
+        if capacity_packets is not None and sum(capacity_packets.values()) > 0:
+            total_capacity = sum(capacity_packets.values())
+            # 平均排队时延 = (总积压包数 / 总服务速率) * 时隙长度
+            avg_delay = (total_rt_packets / total_capacity) * self.slot_duration
+        else:
+            # 方法 B: 理论公式(9) —— 队列积压包数 * 单时隙时长
+            # 表示当前积压的实时包在平均情况下需要等待的累积时隙数
+            avg_delay = np.mean(self.realtime_queue) * self.slot_duration
+
+        return float(avg_delay)
     # ========================================================================
     # 7. 核心: 执行一步动作 (对应 算法1 步骤11~12)
     # ========================================================================
@@ -451,14 +460,21 @@ class LEOSatEnv:
                 self.nrt_queue[i] = max_packets_threshold * 2
 
         # ------ (6) 计算单目标奖励 (块④ 步骤12) ------
+        # ------ (6) 计算单目标奖励 (块④ 步骤12) L审阅 ------
         if self.objective == 'throughput':
             # 公式(10): 最大化非实时吞吐量 -> 奖励 = 本时隙传输的非实时包数
             reward = float(served_nrt_total)
 
         elif self.objective == 'delay':
-            # 公式(9): 最小化实时时延 -> 奖励 = -平均时延 (DQN最大化它)
-            avg_delay = self._calculate_avg_delay()
-            reward = -avg_delay
+            # 公式(9): 最小化实时时延 -> 奖励 = -平均时延 (单位: 秒)
+            # 传入当前时隙的 capacity_packets 计算精确时延
+            avg_delay = self._calculate_avg_delay(capacity_packets)
+
+            # 强化学习要求 Reward 尽可能平滑：
+            # 考虑到最大允许时延 threshold 为 0.4s (400ms)，进行归一化缩放
+            # 当 delay = 0 时 reward = 0; 当 delay >= 0.4s 时 reward <= -1.0
+            normalized_delay_reward = - (avg_delay / self.delay_threshold)
+            reward = float(normalized_delay_reward)
 
         elif self.objective == 'satisfaction':
             # 公式(11): 最大化服务满意度 -> 奖励 = 当前全局平均满意度
@@ -466,20 +482,21 @@ class LEOSatEnv:
             reward = float(np.mean(satisfaction))
         else:
             raise ValueError(f"未知目标: {self.objective}")
-
         # ------ (7) 步进时间与状态更新 ------
         self.current_slot += 1
         next_state = self._get_state()
 
+
         # ------ (8) 返回 ------
-        # done: 本环境固定1000时隙，但由外部循环控制，此处始终返回False
         done = False
 
-        # info: 用于调试和绘图
+        # info: 用于调试和绘图 (精确对应公式 9)
+        current_avg_delay = self._calculate_avg_delay(capacity_packets)
         satisfaction = self.cumulative_served / (self.cumulative_demanded + 1e-8)
+
         info = {
-            'avg_delay': self._calculate_avg_delay(),
-            'throughput': served_nrt_total,
+            'avg_delay': current_avg_delay,  # 单位: 秒 (s)
+            'throughput': served_nrt_total,  # 单位: 包数
             'satisfaction': np.mean(satisfaction),
             'action': action,
             'capacity': capacity_packets
@@ -491,17 +508,17 @@ class LEOSatEnv:
 # ============================================================================
 # 测试代码 (独立运行环境，验证干扰矩阵和队列逻辑)
 # ============================================================================
-if __name__ == "__main__":
-    # 快速测试环境是否正常工作
-    env = LEOSatEnv(objective='throughput')
-    state = env.reset()
-    print(f"初始状态包矩阵形状: {state['packet_matrix'].shape}")
-    print(f"初始满意度形状: {state['satisfaction'].shape}")
-
-    # 随机执行几步
-    for t in range(5):
-        action = random.sample(range(env.N), env.K)
-        next_state, reward, done, info = env.step(action)
-        print(f"时隙 {t + 1}: 动作 {action} -> 奖励 {reward:.2f}, 吞吐量 {info['throughput']}")
-
-    print("环境测试通过！")
+# if __name__ == "__main__":
+#     # 快速测试环境是否正常工作
+#     env = LEOSatEnv(objective='throughput')
+#     state = env.reset()
+#     print(f"初始状态包矩阵形状: {state['packet_matrix'].shape}")
+#     print(f"初始满意度形状: {state['satisfaction'].shape}")
+#
+#     # 随机执行几步
+#     for t in range(5):
+#         action = random.sample(range(env.N), env.K)
+#         next_state, reward, done, info = env.step(action)
+#         print(f"时隙 {t + 1}: 动作 {action} -> 奖励 {reward:.2f}, 吞吐量 {info['throughput']}")
+#
+#     print("环境测试通过！")
