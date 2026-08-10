@@ -3,7 +3,7 @@
 import numpy as np #矩阵数学 无需多言
 from scipy.special import jv  # 贝塞尔函数，用于公式(3)
 import random
-
+from collections import deque   # <--- 新增导入 为了跟踪数据包进入时隙
 T_noise = 300  # 噪声温度 300 K 表1 全局变量
 Bo = 1.38e-23  # 玻尔兹曼常数 表1 全局变量
 
@@ -63,6 +63,21 @@ class LEOSatEnv:
 
         # ---------- 4. 队列与统计变量 (对应 1.4 ~ 1.5 节) ----------
         # 实时队列 ψ_1 (时延敏感) 和非实时队列 ψ_2 (吞吐量敏感)
+        # ---------- 4. 队列与统计变量 (对应 1.4 ~ 1.5 节) ----------
+        # 将原有的整型 numpy 数组替换为包含 N 个 deque 的列表
+        # 每个 deque 存放该波位当前所有积压数据包的到达时隙 (int)
+        self.rt_queue_timestamps = [deque() for _ in range(self.N)]  # 实时队列 ψ1 时间戳
+        self.nrt_queue_timestamps = [deque() for _ in range(self.N)]  # 非实时队列 ψ2 时间戳
+
+        # 兼容性属性：保留 realtime_queue / nrt_queue 方便直接读取当前队列长度
+        @property
+        def realtime_queue(self):
+            return np.array([len(q) for q in self.rt_queue_timestamps], dtype=np.int32)
+
+        @property
+        def nrt_queue(self):
+            return np.array([len(q) for q in self.nrt_queue_timestamps], dtype=np.int32)
+
 
         self.base_demand = np.array([800, 700, 1300, 300, 980, 250,
                                      1000, 275, 80, 600, 50, 200]) #图6 估测数据
@@ -267,51 +282,37 @@ class LEOSatEnv:
     # 4. 环境重置 (对应 算法1 步骤9)
     # ========================================================================
     def reset(self):
-        """
-        重置环境状态 (新的一个卫星过顶 / 新的训练周期)
-        返回:
-            state (dict): 初始状态字典
-        """
-        # 清空队列
-        self.realtime_queue = np.zeros(self.N, dtype=np.int32)
-        self.nrt_queue = np.zeros(self.N, dtype=np.int32)
+        # 清空时间戳队列
+        self.rt_queue_timestamps = [deque() for _ in range(self.N)]
+        self.nrt_queue_timestamps = [deque() for _ in range(self.N)]
 
         # 清空统计累加器
         self.cumulative_served = np.zeros(self.N)
-        self.cumulative_demanded = np.zeros(self.N)#L:置零 和开始时候一样
+        self.cumulative_demanded = np.zeros(self.N)
 
         # 重置时间
         self.current_slot = 0
 
-        # 生成初始到达率 实时和非实时的包的到达
+        # 生成初始到达率
         self.lambda_realtime, self.lambda_nrt = self._get_traffic_rates(self.current_slot)
 
-        # 返回初始状态
-        state = self._get_state()
-        return state
+        return self._get_state()
 
     # ========================================================================
     # 5. 状态构造 (对应 公式19~24) L用于生成矩阵
     # ========================================================================
     def _get_state(self):
-        """
-        构造当前状态 s_t
+        # 提取各个波位当前的队列长度
+        rt_lengths = [len(q) for q in self.rt_queue_timestamps]
+        nrt_lengths = [len(q) for q in self.nrt_queue_timestamps]
 
-        状态组成:
-            1. packet_matrix (2, 12): 第一行实时包数, 第二行非实时包数
-            2. satisfaction (12,): 各波位满意度 (公式24)
-
-        返回:
-            dict: {'packet_matrix': ndarray, 'satisfaction': ndarray}
-        """
         packet_matrix = np.vstack([
-            self.realtime_queue.astype(np.float32),
-            self.nrt_queue.astype(np.float32)
+            np.array(rt_lengths, dtype=np.float32),
+            np.array(nrt_lengths, dtype=np.float32)
         ])  # shape: (2, 12)
 
-        # 计算满意度 (公式24): η = 累计服务 / 累计需求
-        satisfaction = self.cumulative_served / (self.cumulative_demanded + 1e-8) #为什么？
-        satisfaction = np.clip(satisfaction, 0.0, 1.0)  # 截断到 [0, 1]
+        satisfaction = self.cumulative_served / (self.cumulative_demanded + 1e-8)
+        satisfaction = np.clip(satisfaction, 0.0, 1.0)
 
         return {
             'packet_matrix': packet_matrix,
@@ -325,7 +326,7 @@ class LEOSatEnv:
 
     def _calculate_avg_delay(self, capacity_packets=None):
         """
-        根据公式(9)精确计算/估算实时数据包的平均排队时延 (秒/ms)
+        根据公式(9)精确计算实时数据包的平均排队时延 (秒/ms)
 
         参数:
             capacity_packets (dict, optional): 当前时隙各波位的服务容量(包数)
@@ -349,34 +350,35 @@ class LEOSatEnv:
     # 7. 核心: 执行一步动作 (对应 算法1 步骤11~12)
     # ========================================================================
     def step(self, action):
-        """
-        执行动作，环境状态转移
-
-        参数:
-            action (list): 长度为 K=4 的波位 ID 列表, 如 [2, 5, 7, 11]
-
-        返回:
-            next_state (dict): 下一状态
-            reward (float): 单目标标量奖励
-            done (bool): 是否结束 (本环境固定1000步，设为False)
-            info (dict): 调试信息 (平均时延、吞吐量、满意度)
-        """
-        # ------ (1) 动作解码与功率分配 (公式18) ------
-        # 确保 action 有 K 个不同元素
+        # ------ (0) 动作前置校验 (确保选出 K 个波位) ------
         action = list(set(action))
         if len(action) < self.K:
-            # 补齐随机波位 (避免少于K个)
             remaining = [i for i in range(self.N) if i not in action]
             action += random.sample(remaining, self.K - len(action))
-        action = action[:self.K]  # 截断至K个
+        action = action[:self.K]
 
-        # 计算各选中波位的功率权重: weight = (总包数) * (平均排队时延)
+        # ------ (1) 精确计算各波位当前的物理排队时延 & 功率分配 (公式18) ------
+        current_rt_delays = np.zeros(self.N)  # 记录各波位实时包平均排队时延 (秒)
+
+        for i in range(self.N):
+            rt_q = self.rt_queue_timestamps[i]
+            if len(rt_q) > 0:
+                # 等待时隙数 = 当前时隙 - 入队时隙
+                waiting_slots = self.current_slot - np.array(rt_q)
+                # 转化为物理时间 (秒)
+                current_rt_delays[i] = np.mean(waiting_slots) * self.slot_duration
+            else:
+                current_rt_delays[i] = 0.0
+
+        # 根据公式 (18) 计算功率权重
         weights = {}
         for i in action:
-            total_packets = self.realtime_queue[i] + self.nrt_queue[i]
-            # 用队列长度近似时延权重
-            delay_weight = self.realtime_queue[i] * 1.0 + self.nrt_queue[i] * 0.5
-            weights[i] = (total_packets + 1) * (delay_weight + 1)  # +1防零
+            total_packets = len(self.rt_queue_timestamps[i]) + len(self.nrt_queue_timestamps[i])
+            # delay_weight 严格采用上面算出的物理真实排队时延 (单位: 秒)
+            delay_weight = current_rt_delays[i]
+
+            # W_i = (总包数 + 1) * (时延 + 防零平滑项)
+            weights[i] = (total_packets + 1) * (delay_weight + 1e-5)
 
         total_weight = sum(weights.values())
         allocated_power = {}
@@ -385,119 +387,104 @@ class LEOSatEnv:
             allocated_power[i] = min(p_i, self.max_beam_power)
 
         # ------ (2) 干扰计算与信道容量 (公式2~7) ------
-        SINR_dict = {}
         capacity_packets = {}
-
         for i in action:
-            # 累加来自其他选中波位的干扰功率
             interference_sum = 0.0
             for j in action:
                 if i != j:
-                    # 查预计算干扰矩阵，乘上干扰源的发射功率
                     interference_sum += self.interference_matrix[i][j] * allocated_power[j]
 
-            # 噪声功率: N0 = k * T * B
             noise_power = Bo * T_noise * self.bandwidth
-
-            # 公式(7): SINR = (P_i * G_t * G_r) / (I + N0)
-            # 注: 链路损耗 L_sl 在干扰矩阵预计算中已包含，此处省略常数因子
             signal_power = allocated_power[i] * (10 ** (self.G_t / 10)) * (10 ** (self.G_r / 10))
             sinr = signal_power / (interference_sum + noise_power)
-            SINR_dict[i] = sinr
 
-            # 公式(6): 信道容量 C = B * log2(1 + SINR)  (bps)
             capacity_bps = self.bandwidth * np.log2(1 + sinr)
-            # 转换为每时隙能传输的包数 (公式17 前半部分)
             max_packets = (capacity_bps * self.slot_duration) / self.packet_size
             capacity_packets[i] = int(np.floor(max_packets))
 
-        # ------ (3) 队列更新: 先入队 (泊松到达) ------
-        # 更新到达率 (随当前时隙变化)
+        # ------ (3) 队列更新: 先入队 (泊松到达 & 记录到达时隙) ------
         self.lambda_realtime, self.lambda_nrt = self._get_traffic_rates(self.current_slot)
 
         for i in range(self.N):
-            # 实时包到达
             arrive_rt = np.random.poisson(self.lambda_realtime[i])
-            self.realtime_queue[i] += arrive_rt
-            # 非实时包到达
             arrive_nrt = np.random.poisson(self.lambda_nrt[i])
-            self.nrt_queue[i] += arrive_nrt
+
+            # 将新到达的数据包其到达时隙 (self.current_slot) 压入队列
+            for _ in range(arrive_rt):
+                self.rt_queue_timestamps[i].append(self.current_slot)
+            for _ in range(arrive_nrt):
+                self.nrt_queue_timestamps[i].append(self.current_slot)
 
             # 更新累计需求 (公式11 分母)
             self.cumulative_demanded[i] += (arrive_rt + arrive_nrt)
 
-        # ------ (4) 队列更新: 后出队 (先实时后非实时) ------
+        # ------ (4) 队列更新: 后出队 (先实时后非实时, FIFO 弹出最老的包) ------
         served_realtime_total = 0
         served_nrt_total = 0
-        served_dict = {}  # 记录每个波位服务了多少包
 
         for i in action:
             cap = capacity_packets[i]
-            # 优先服务实时数据 (时延敏感)
-            served_rt = min(self.realtime_queue[i], cap)
-            self.realtime_queue[i] -= served_rt
+
+            # 1. 服务实时包 (FIFO: 从左侧弹出最先进入的包)
+            served_rt = min(len(self.rt_queue_timestamps[i]), cap)
+            for _ in range(served_rt):
+                self.rt_queue_timestamps[i].popleft()
             cap -= served_rt
             served_realtime_total += served_rt
 
-            # 剩余容量服务非实时数据
-            served_nrt = min(self.nrt_queue[i], cap)
-            self.nrt_queue[i] -= served_nrt
-            cap -= served_nrt
+            # 2. 剩余容量服务非实时包
+            served_nrt = min(len(self.nrt_queue_timestamps[i]), cap)
+            for _ in range(served_nrt):
+                self.nrt_queue_timestamps[i].popleft()
             served_nrt_total += served_nrt
 
-            served_dict[i] = (served_rt, served_nrt)
             # 更新累计服务 (公式24 分子)
             self.cumulative_served[i] += (served_rt + served_nrt)
 
-        # ------ (5) 丢包处理 (时延阈值 T_th = 400ms, 公式16) ------
-        # 若队列积压超过阈值 (用包数*时隙长度近似估计超时)，丢弃最老包
-        max_packets_threshold = int(self.delay_threshold / self.slot_duration) * 2  # 约80包
-        for i in range(self.N):
-            if self.realtime_queue[i] > max_packets_threshold:
-                # 丢弃超出的实时包
-                self.realtime_queue[i] = max_packets_threshold
-            if self.nrt_queue[i] > max_packets_threshold * 2:
-                self.nrt_queue[i] = max_packets_threshold * 2
+        # ------ (5) 丢包处理 (超时丢弃最老包, 公式16) ------
+        # 超时阈值对应的时隙个数 T_th / T_slot
+        max_slots_threshold = int(self.delay_threshold / self.slot_duration)  # 0.4s / 0.01s = 40 时隙
 
-        # ------ (6) 计算单目标奖励 (块④ 步骤12) ------
-        # ------ (6) 计算单目标奖励 (块④ 步骤12) L审阅 ------
+        for i in range(self.N):
+            # 丢弃实时队列里在队列中滞留超过 40 个时隙的数据包
+            while len(self.rt_queue_timestamps[i]) > 0:
+                oldest_packet_slot = self.rt_queue_timestamps[i][0]
+                if (self.current_slot - oldest_packet_slot) > max_slots_threshold:
+                    self.rt_queue_timestamps[i].popleft()  # 丢弃超时数据包
+                else:
+                    break  # 队头最老的包都没超时，后面的包肯定也没超时
+
+        # ------ (6) 计算单目标奖励 (公式9 / 公式10 / 公式11) ------
         if self.objective == 'throughput':
-            # 公式(10): 最大化非实时吞吐量 -> 奖励 = 本时隙传输的非实时包数
             reward = float(served_nrt_total)
 
         elif self.objective == 'delay':
-            # 公式(9): 最小化实时时延 -> 奖励 = -平均时延 (单位: 秒)
-            # 传入当前时隙的 capacity_packets 计算精确时延
-            avg_delay = self._calculate_avg_delay(capacity_packets)
+            # 采用全网实时包的加权平均时延作为公式 (9) 的计算结果
+            total_rt_packets = sum([len(q) for q in self.rt_queue_timestamps])
+            if total_rt_packets > 0:
+                # 计算当前时刻全网所有实时包的平均排队时延
+                system_avg_delay = np.sum(
+                    [current_rt_delays[i] * len(self.rt_queue_timestamps[i]) for i in range(self.N)]) / total_rt_packets
+            else:
+                system_avg_delay = 0.0
 
-            # 强化学习要求 Reward 尽可能平滑：
-            # 考虑到最大允许时延 threshold 为 0.4s (400ms)，进行归一化缩放
-            # 当 delay = 0 时 reward = 0; 当 delay >= 0.4s 时 reward <= -1.0
-            normalized_delay_reward = - (avg_delay / self.delay_threshold)
-            reward = float(normalized_delay_reward)
+            # 奖励归一化：负的时延占比，目标是让 delay 越小越好
+            reward = - float(system_avg_delay / self.delay_threshold)
 
         elif self.objective == 'satisfaction':
-            # 公式(11): 最大化服务满意度 -> 奖励 = 当前全局平均满意度
             satisfaction = self.cumulative_served / (self.cumulative_demanded + 1e-8)
             reward = float(np.mean(satisfaction))
-        else:
-            raise ValueError(f"未知目标: {self.objective}")
-        # ------ (7) 步进时间与状态更新 ------
+
+        # ------ (7) 时隙递增与状态生成 ------
         self.current_slot += 1
         next_state = self._get_state()
-
-
-        # ------ (8) 返回 ------
         done = False
 
-        # info: 用于调试和绘图 (精确对应公式 9)
-        current_avg_delay = self._calculate_avg_delay(capacity_packets)
-        satisfaction = self.cumulative_served / (self.cumulative_demanded + 1e-8)
-
+        # ------ (8) 返回 info ------
         info = {
-            'avg_delay': current_avg_delay,  # 单位: 秒 (s)
-            'throughput': served_nrt_total,  # 单位: 包数
-            'satisfaction': np.mean(satisfaction),
+            'avg_delay': np.mean(current_rt_delays),  # 各波位平均排队时延 (s)
+            'throughput': served_nrt_total,
+            'satisfaction': np.mean(self.cumulative_served / (self.cumulative_demanded + 1e-8)),
             'action': action,
             'capacity': capacity_packets
         }
