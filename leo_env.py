@@ -70,13 +70,13 @@ class LEOSatEnv:
         self.nrt_queue_timestamps = [deque() for _ in range(self.N)]  # 非实时队列 ψ2 时间戳
 
         # 兼容性属性：保留 realtime_queue / nrt_queue 方便直接读取当前队列长度
-        @property
-        def realtime_queue(self):
-            return np.array([len(q) for q in self.rt_queue_timestamps], dtype=np.int32)
-
-        @property
-        def nrt_queue(self):
-            return np.array([len(q) for q in self.nrt_queue_timestamps], dtype=np.int32)
+        # @property
+        # def realtime_queue(self):
+        #     return np.array([len(q) for q in self.rt_queue_timestamps], dtype=np.int32)
+        #
+        # @property
+        # def nrt_queue(self):
+        #     return np.array([len(q) for q in self.nrt_queue_timestamps], dtype=np.int32)
 
 
         self.base_demand = np.array([800, 700, 1300, 300, 980, 250,
@@ -97,8 +97,8 @@ class LEOSatEnv:
         self.base_packet_rate = 50# 基准包到达率 (每个 10ms 时隙平均到达的包数  L：？ )
 
         # 实时队列 ψ_1 (时延敏感) 和非实时队列 ψ_2 (吞吐量敏感)
-        self.realtime_queue = np.zeros(self.N, dtype=np.int32)  # 积压的实时包个数
-        self.nrt_queue = np.zeros(self.N, dtype=np.int32)  # 积压的非实时包个数
+        # self.realtime_queue = np.zeros(self.N, dtype=np.int32)  # 积压的实时包个数
+        # self.nrt_queue = np.zeros(self.N, dtype=np.int32)  # 积压的非实时包个数 L：修改为静态数组后没有必要了
 
         # 满意度统计累加器 (公式24)
         self.cumulative_served = np.zeros(self.N)  # 累计已服务包数
@@ -319,6 +319,14 @@ class LEOSatEnv:
     # 6. 计算平均时延 (对应论文 公式 9)
     # ========================================================================
 
+    @property
+    def realtime_queue(self):
+        return np.array([len(q) for q in self.rt_queue_timestamps], dtype=np.int32)
+
+    @property
+    def nrt_queue(self):
+        return np.array([len(q) for q in self.nrt_queue_timestamps], dtype=np.int32)
+
     def _calculate_avg_delay(self, capacity_packets=None):
         """
         根据公式(9)精确计算实时数据包的平均排队时延 (秒/ms)
@@ -369,7 +377,7 @@ class LEOSatEnv:
         weights = {}
         for i in action:
             total_packets = len(self.rt_queue_timestamps[i]) + len(self.nrt_queue_timestamps[i])
-            # delay_weight 严格采用上面算出的物理真实排队时延 (单位: 秒)
+            # delay_weight 严格采用上面算出的排队时延 (单位: 秒)
             delay_weight = current_rt_delays[i]
 
             # W_i = (总包数 + 1) * (时延 + 防零平滑项)
@@ -390,7 +398,16 @@ class LEOSatEnv:
                     interference_sum += self.interference_matrix[i][j] * allocated_power[j]
 
             noise_power = Bo * T_noise * self.bandwidth
-            signal_power = allocated_power[i] * (10 ** (self.G_t / 10)) * (10 ** (self.G_r / 10))
+
+            # 考虑到卫星到波位 i 的直达路径损耗 d_i
+            xi_m, yi_m = self.spot_positions[i] * 1000.0  # km 转换为 m
+            d_i_m = np.sqrt(xi_m**2 + yi_m**2 + self.h**2)  # 全米单位计算
+            path_loss_i = (self.lambda_wave / (4 * np.pi * d_i_m)) ** 2
+
+            # 有用信号功率 P_i * G_t * G_r * PathLoss
+            signal_power = allocated_power[i] * (10 ** (self.G_t / 10)) * (10 ** (self.G_r / 10)) * path_loss_i
+
+
             sinr = signal_power / (interference_sum + noise_power)
 
             capacity_bps = self.bandwidth * np.log2(1 + sinr)
