@@ -268,8 +268,7 @@ class LEOSatEnv:
     # ========================================================================
     def reset(self):
         """
-        重置环境状态 (新的一颗卫星过顶 / 新的训练周期)
-
+        重置环境状态 (新的一个卫星过顶 / 新的训练周期)
         返回:
             state (dict): 初始状态字典
         """
@@ -279,12 +278,12 @@ class LEOSatEnv:
 
         # 清空统计累加器
         self.cumulative_served = np.zeros(self.N)
-        self.cumulative_demanded = np.zeros(self.N)
+        self.cumulative_demanded = np.zeros(self.N)#L:置零 和开始时候一样
 
         # 重置时间
         self.current_slot = 0
 
-        # 生成初始到达率
+        # 生成初始到达率 实时和非实时的包的到达
         self.lambda_realtime, self.lambda_nrt = self._get_traffic_rates(self.current_slot)
 
         # 返回初始状态
@@ -292,7 +291,7 @@ class LEOSatEnv:
         return state
 
     # ========================================================================
-    # 5. 状态构造 (对应 公式19~24)
+    # 5. 状态构造 (对应 公式19~24) L用于生成矩阵
     # ========================================================================
     def _get_state(self):
         """
@@ -311,7 +310,7 @@ class LEOSatEnv:
         ])  # shape: (2, 12)
 
         # 计算满意度 (公式24): η = 累计服务 / 累计需求
-        satisfaction = self.cumulative_served / (self.cumulative_demanded + 1e-8)
+        satisfaction = self.cumulative_served / (self.cumulative_demanded + 1e-8) #为什么？
         satisfaction = np.clip(satisfaction, 0.0, 1.0)  # 截断到 [0, 1]
 
         return {
