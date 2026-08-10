@@ -271,12 +271,7 @@ class LEOSatEnv:
         lambda_rt_expected = np.maximum(total_expected_rate * 0.5, 0.0)
         lambda_nrt_expected = np.maximum(total_expected_rate * 0.5, 0.0)
 
-        # 泊松采样
-        # 根据这个期望均值生成服从泊松分布的真实整数包个数，从而在离散事件仿真中完美模拟真实网络流量的突发性和随机性
-        lambda_rt = np.random.poisson(lambda_rt_expected)
-        lambda_nrt = np.random.poisson(lambda_nrt_expected)
-
-        return lambda_rt, lambda_nrt
+        return lambda_rt_expected, lambda_nrt_expected
 
     # ========================================================================
     # 4. 环境重置 (对应 算法1 步骤9)
@@ -495,17 +490,17 @@ class LEOSatEnv:
 # ============================================================================
 # 测试代码 (独立运行环境，验证干扰矩阵和队列逻辑)
 # ============================================================================
-# if __name__ == "__main__":
-#     # 快速测试环境是否正常工作
-#     env = LEOSatEnv(objective='throughput')
-#     state = env.reset()
-#     print(f"初始状态包矩阵形状: {state['packet_matrix'].shape}")
-#     print(f"初始满意度形状: {state['satisfaction'].shape}")
-#
-#     # 随机执行几步
-#     for t in range(5):
-#         action = random.sample(range(env.N), env.K)
-#         next_state, reward, done, info = env.step(action)
-#         print(f"时隙 {t + 1}: 动作 {action} -> 奖励 {reward:.2f}, 吞吐量 {info['throughput']}")
-#
-#     print("环境测试通过！")
+if __name__ == "__main__":
+    # 快速测试环境是否正常工作
+    env = LEOSatEnv(objective='throughput')
+    state = env.reset()
+    print(f"初始状态包矩阵形状: {state['packet_matrix'].shape}")
+    print(f"初始满意度形状: {state['satisfaction'].shape}")
+
+    # 随机执行几步
+    for t in range(5):
+        action = random.sample(range(env.N), env.K)
+        next_state, reward, done, info = env.step(action)
+        print(f"时隙 {t + 1}: 动作 {action} -> 奖励 {reward:.2f}, 吞吐量 {info['throughput']}")
+
+    print("环境测试通过！")
